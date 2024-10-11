@@ -23,5 +23,4 @@ $ docker run --name=gogs -p 10022:22 -p 10880:3000 -v /var/gogs:/data gogs/gogs
 $ docker start gogs
 ```
 
-
 After the Gogs is up, set the repos and push your code to Gogs
