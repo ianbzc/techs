@@ -1,4 +1,4 @@
-In this repo, I list some techs I have used in my two recents projects and share some technical details in regards to how I have used them.
+In this repo, I list some techs I have used in my two recent projects and share some technical details in regard to how I have used them.
 
 
 # CI/CD Pipeline in My Project
@@ -6,7 +6,7 @@ In this repo, I list some techs I have used in my two recents projects and share
 ![CI/CD Pipeline](./assets/cicd.png)
 
 
-In my project, I use Gogs, Drone, and Harbor to build a CI/CD pipeline. Gogs is used for code repo. With Harbor, I build a 
+In my project, I use Gogs, Drone, and Harbor to build a CI/CD pipeline. Gogs is used for code repo. With Harbor, I build an 
 image registry. Drone automates the image build, push, and deployment process. It has enabled me to realize automation using just 
 a YAML file.
 
@@ -53,7 +53,7 @@ type GinApiHandler interface {
 ```
 
 
-`IocContainer` has three important methods:
+`IocContainer` has four important methods:
 ```go
 {
     Init() error
@@ -183,6 +183,197 @@ With the dependency injection pattern, the project is more extensible.
 
 
 # RabbitMQ
+
+RabbitMQ is one of the most popular message brokers in modern software. In my app, I have designed and implemented a RabbitMQ module
+that can easily be used in different contexts. 
+
+Define the `MQClient` structure. 
+
+```go
+type MQClient struct {
+	Connection     *amqp.Connection
+	Channel        *amqp.Channel
+    //result channels are used to save the results
+	resultChannels map[string]chan interface{}
+    //since resultChannels is not thread safe, we need to mutex lock
+	lock           sync.Mutex
+	ctx            *gin.Context
+}
+```
+
+
+Methods:
+```go
+func (mq *MQClient) Publish(c *gin.Context, queueName string, body interface{}, resultChan chan interface{}) error {
+    /*
+    this method receive request and data and save the result channel passed in
+    */
+    
+    //we need this context object later, so we need to save it as well
+	mq.ctx = c
+    // encode the data
+	data, err := json.Marshal(body)
+	if err != nil {
+		return err
+	}
+    //pass in the data
+	err = mq.Channel.Publish(
+		"",
+		queueName,
+		false,
+		false,
+		amqp.Publishing{
+			ContentType: "text/plain",
+			Body:        data,
+		},
+	)
+	if err != nil {
+		return err
+	}
+
+	mq.StoreResultChannel(queueName, resultChan)
+	return nil
+}
+
+func (mq *MQClient) Consumer(queueName string) (<-chan amqp.Delivery, error) {
+    /*
+    the method send msgs 
+    */
+	return mq.Channel.Consume(
+		queueName,
+		"",
+		false,
+		false,
+		false,
+		false,
+		nil,
+	)
+}
+
+func (mq *MQClient)
+
+func (mq *MQClient) GetCtx() *gin.Context {
+	return mq.ctx
+}
+
+func (mq *MQClient) StoreResultChannel(queueName string, resultChan chan interface{}) {
+    //this method saves the result channel passed in
+	mq.lock.Lock()
+	defer mq.lock.Unlock()
+	if mq.resultChannels == nil {
+		mq.resultChannels = make(map[string]chan interface{})
+	}
+	mq.resultChannels[queueName] = resultChan
+}
+
+func (mq *MQClient) RetrieveResultChannel(queueName string) chan interface{} {
+    // this method retrieves the channel that's saving the result
+	mq.lock.Lock()
+	defer mq.lock.Unlock()
+	if mq.resultChannels == nil {
+		return nil
+	}
+	resultChan, ok := mq.resultChannels[queueName]
+	if !ok {
+		return nil
+	}
+	delete(mq.resultChannels, queueName)
+	return resultChan
+}
+```
+
+
+Use it for Creating Blogs
+
+Normally, inside the `BlogApiHandler`, there is a method directly calling `Blog` service to create the blog. 
+However, with RabbitMQ, this logic now resides in the generic consumer function.
+
+
+```go
+func (b *BlogApiHandler) CreateBlogWithMQ(c *gin.Context) {
+
+	...
+    
+	newReq := blog.NewCreateBlogRequest()
+	err := c.BindJSON(newReq)
+	...
+
+	newReq.CreatedBy = theToken.UserName
+    
+    //create a result channel and pass it to the publish function, the result will be saved to this channel
+	resultChan := make(chan interface{}, 1)
+	defer close(resultChan)
+
+	err = mqimpl.GetMQClient().Publish(c, mq.CREATE_BLOG_QUEUE, newReq, resultChan)
+
+	// newBlog, err := b.svc.CreateBlog(c.Request.Context(), newReq)
+	if err != nil {
+
+		response.Failed(c, err)
+		// c.JSON(http.StatusBadRequest, err.Error())
+		return
+	}
+    //the channel is stuck until the result is passed in
+	createdBlog := <-resultChan
+	if createdBlog == nil {
+		response.Failed(c, fmt.Errorf("failed to create blog"))
+		return
+	}
+	response.Success(c, createdBlog)
+
+}
+```
+
+
+Consume the messages from producer. 
+
+
+```go
+func (b *BlogApiHandler) ConsumeCreateBlog() {
+	msgs, err := mqimpl.GetMQClient().Consumer(mq.CREATE_BLOG_QUEUE)
+	if err != nil {
+		log.Fatalf("Failed to register a consumer: %v", err)
+	}
+
+	go func() {
+		for d := range msgs {
+			var req blog.CreateBlogRequest
+			err := json.Unmarshal(d.Body, &req)
+			if err != nil {
+				log.Printf("Error decoding JSON: %v", err)
+				continue
+			}
+			if mqimpl.GetMQClient().GetCtx() == nil {
+				fmt.Println(mqimpl.GetMQClient().GetCtx())
+				d.Ack(false)
+				continue
+			}
+
+			createdBlog, err := b.svc.CreateBlog(mqimpl.GetMQClient().GetCtx().Request.Context(), &req)
+			if err != nil {
+				log.Printf("Failed to create blog: %v", err)
+				d.Ack(false)
+				continue
+			}
+			d.Ack(false)
+
+			// Retrieve the result channel and send the created blog
+			resultChan := mqimpl.GetMQClient().RetrieveResultChannel(mq.CREATE_BLOG_QUEUE)
+			resultChan <- createdBlog
+		}
+	}()
+}
+```
+
+
+This function resides in the API handler. However, this is a bad design. It could have been a generic method for `MQClient`. The method's 
+signature could be as follows. This improvement would involve designing a new interface for all other methods in the handlers and new interfaces for request and responses.
+
+```go
+func (mq *MQClient) ConsumeMsgs(string, func(context.Context, req)(result, error))
+```
+
+
 
 
 
